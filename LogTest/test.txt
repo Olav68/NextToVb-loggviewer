@@ -1,6 +1,0 @@
-Method: POST
-RequestUri: https://hub.megler.vitec.net/MSEMSR/Accounting/Postings
-Id: 00d50b99-f587-4678-828d-6bfc0990150e
-Headers: 
-Content:
-{"postings":[{"postingId":null,"departmentId":2844,"externalReference":"POST_00d50b99-f587-4678-828d-6bfc0990150e","voucherNumber":419366,"productCode":"","voucherLines":[{"assignmentNumber":"2844260120","externalReference":"POST_00d50b99-f587-4678-828d-6bfc0990150e","account":"50185","ledgerType":3,"description":"Statens Kartverk","customerId":"","amount":-545.0,"vatAmount":0.0,"vatRate":0.0,"vatCode":0,"kid":"05017940171","lineNumber":79,"postingDate":"2026-06-01T00:00:00","dueDate":"2026-06-15T00:00:00","productCode":"","paymentOfExternalReference":null,"outboundInvoiceExternalReference":null,"bankAccountNumber":null,"bankTransactionDate":null,"userId":null},{"assignmentNumber":"2844260120","externalReference":"POST_00d50b99-f587-4678-828d-6bfc0990150e","account":"2791","ledgerType":1,"description":"Gebyr pantedokument","customerId":"","amount":545.0,"vatAmount":0.0,"vatRate":0.0,"vatCode":0,"kid":"05017940171","lineNumber":80,"postingDate":"2026-06-01T00:00:00","dueDate":"2026-06-15T00:00:00","productCode":"","paymentOfExternalReference":null,"outboundInvoiceExternalReference":null,"bankAccountNumber":null,"bankTransactionDate":null,"userId":null}],"postAsDraft":false,"assignmentNumber":null,"userId":null}]}
