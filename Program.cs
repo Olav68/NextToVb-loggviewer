@@ -226,22 +226,23 @@ app.MapGet("/api/locks", async (IHttpClientFactory httpClientFactory) =>
     if (!TryCreateLocksClient(httpClientFactory, locksApiBaseUrl, locksApiUsername, locksApiPassword, out var client, out var configurationError))
         return Results.Json(new { error = configurationError }, statusCode: 503);
 
-    try
+    // Hvert endepunkt hentes for seg, slik at én feil ikke skjuler låser fra de andre.
+    var endpoints = new[] { "api/Assignments/Locks", "api/Postings/Locks", "api/Remits/Locks", "api/OutboundInvoices/Locks" };
+    var results = await Task.WhenAll(endpoints.Select(async endpoint =>
     {
-        var endpointTasks = new[]
+        try
         {
-            GetLocksAsync(client, "api/Assignments/Locks", app.Logger),
-            GetLocksAsync(client, "api/Postings/Locks", app.Logger),
-            GetLocksAsync(client, "api/Remits/Locks", app.Logger),
-            GetLocksAsync(client, "api/OutboundInvoices/Locks", app.Logger)
-        };
-        var lockGroups = await Task.WhenAll(endpointTasks);
-        return Results.Json(lockGroups.SelectMany(group => group).OrderBy(lockItem => lockItem.TypeOfLock).ThenBy(lockItem => lockItem.InstallationId).ThenBy(lockItem => lockItem.LockId));
-    }
-    catch (LocksApiException exception)
-    {
-        return Results.Json(new { error = exception.Message }, statusCode: exception.StatusCode);
-    }
+            return (Locks: await GetLocksAsync(client, endpoint, app.Logger), Error: (string?)null);
+        }
+        catch (LocksApiException exception)
+        {
+            return (Locks: new List<SystemLockDto>(), Error: exception.Message);
+        }
+    }));
+
+    var locks = results.SelectMany(result => result.Locks).OrderBy(lockItem => lockItem.TypeOfLock).ThenBy(lockItem => lockItem.InstallationId).ThenBy(lockItem => lockItem.LockId);
+    var errors = results.Where(result => result.Error != null).Select(result => result.Error!).ToArray();
+    return Results.Json(new { locks, errors }, statusCode: errors.Length == endpoints.Length ? 502 : 200);
 });
 
 app.MapPost("/api/locks/unlock", async (UnlockLockRequest request, IHttpClientFactory httpClientFactory) =>
@@ -342,7 +343,7 @@ static async Task<List<SystemLockDto>> GetLocksAsync(HttpClient client, string e
         logger.LogInformation("Locks API: GET {Uri} -> HTTP {StatusCode}: {Body}", requestUri, (int)response.StatusCode, snippet);
 
         if (!response.IsSuccessStatusCode)
-            throw new LocksApiException($"Klarte ikke å hente låser fra {requestUri} (HTTP {(int)response.StatusCode}){DescribeRedirect(response)}.", IsRedirect(response) ? 502 : (int)response.StatusCode);
+            throw new LocksApiException($"Klarte ikke å hente låser fra {requestUri} (HTTP {(int)response.StatusCode}){DescribeRedirect(response)}.{DescribeErrorBody(body)}", IsRedirect(response) ? 502 : (int)response.StatusCode);
 
         JsonDocument document;
         try
@@ -373,6 +374,33 @@ static string DescribeRedirect(HttpResponseMessage response)
     return IsRedirect(response) && response.Headers.Location != null
         ? $" – API-et omdirigerer til {response.Headers.Location}. Sett LocksApi:BaseUrl til HTTPS-adressen til API-et"
         : "";
+}
+
+static string DescribeErrorBody(string body)
+{
+    if (string.IsNullOrWhiteSpace(body))
+        return "";
+
+    // ASP.NET Web API returnerer typisk {"Message": ..., "ExceptionMessage": ...} ved 500.
+    try
+    {
+        using var document = JsonDocument.Parse(body);
+        if (document.RootElement.ValueKind == JsonValueKind.Object)
+        {
+            var parts = new[] { "Message", "ExceptionType", "ExceptionMessage" }
+                .Select(name => GetJsonString(document.RootElement, name))
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .ToArray();
+            if (parts.Length > 0)
+                return " Svar fra API: " + string.Join(" | ", parts);
+        }
+    }
+    catch (JsonException)
+    {
+    }
+
+    var text = body.Trim();
+    return " Svar fra API: " + (text.Length > 300 ? text[..300] + "..." : text);
 }
 
 static void ReadLocks(JsonElement element, List<SystemLockDto> locks)
@@ -1416,6 +1444,7 @@ function renderFilteredOutbound() {
 }
 
 var locksData = [];
+var locksErrors = [];
 
 async function loadLocks() {
     var summary = document.getElementById('locks-summary');
@@ -1423,11 +1452,12 @@ async function loadLocks() {
     try {
         var response = await fetch('/api/locks');
         var result = await response.json();
-        if (!response.ok) {
+        if (!response.ok && !result.errors) {
             summary.innerText = result.error || 'Klarte ikke å hente låser.';
             return;
         }
-        locksData = result;
+        locksData = result.locks || [];
+        locksErrors = result.errors || [];
         renderLocks();
     } catch (error) {
         summary.innerText = 'Feil ved lasting av låser.';
@@ -1436,12 +1466,18 @@ async function loadLocks() {
 
 function renderLocks() {
     var summary = document.getElementById('locks-summary');
+    var errorHtml = '';
+    for (var error of locksErrors) {
+        errorHtml += '<div class="lock-error">' + escapeHtml(error) + '</div>';
+    }
+
     if (!locksData.length) {
-        summary.innerHTML = '<div class="locks-empty">Fant ingen aktive låser.</div>';
+        var emptyText = locksErrors.length ? 'Fant ingen aktive låser i endepunktene som svarte.' : 'Fant ingen aktive låser.';
+        summary.innerHTML = errorHtml + '<div class="locks-empty">' + emptyText + '</div>';
         return;
     }
 
-    var html = '<table class="iis-table"><thead><tr><th>Type</th><th>Installasjon</th><th>Lås-ID</th><th>Feilmelding</th><th>Handling</th></tr></thead><tbody>';
+    var html = errorHtml + '<table class="iis-table"><thead><tr><th>Type</th><th>Installasjon</th><th>Lås-ID</th><th>Feilmelding</th><th>Handling</th></tr></thead><tbody>';
     for (var lock of locksData) {
         var canUnlock = lock.typeOfLock !== 'Assignment';
         var title = canUnlock ? 'Lås opp' : 'Assignment-låser har ikke unlock-endepunkt';
