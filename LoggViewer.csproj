@@ -4,10 +4,24 @@
     <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Publiser bare engelske ressurser, ikke språkmapper (cs, de, fr, ...) fra NuGet-pakkene. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- Publiseringsmappen og lokale testfiler ligger i prosjektmappen og skal ikke med i neste publisering. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);artifacts/**;testfiler/**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <!-- Linjenumre i feilmeldinger uten egen .pdb-fil. -->
+    <DebugType>embedded</DebugType>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.SqlClient" Version="7.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Kun for lokal utvikling, og inneholder testpassord. -->
+    <Content Update="appsettings.Development.json" CopyToPublishDirectory="Never" />
   </ItemGroup>
 
 </Project>
