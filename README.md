@@ -31,6 +31,12 @@ Følgende innstillinger brukes:
 - `OutboundLogPath`: Mappe for outbound-logger.
 - `IIS TestFile`, `Inbound TestFile` og `Outbound TestFile`: Valgfrie
 	testfiler som overstyrer standardstiene.
+- `LocksApi:BaseUrl`: HTTPS-adressen til DNBIntegrationServices.
+- `LocksApi:Username` og `LocksApi:Password`: Basic Auth for lock-endepunktene.
+
+Låser av typen Assignment vises i Låser-fanen, men kan ikke låses opp fordi
+API-et ikke har et aktivt unlock-endepunkt for denne typen. Password bør settes
+via miljøvariabel eller annen hemmelig konfigurasjon i produksjon.
 
 Alle filstier valideres mot `AllowedRoots` før filer åpnes. Dette hindrer at
 nettleseren kan be serveren lese vilkårlige filer utenfor de godkjente
@@ -55,6 +61,23 @@ Betydningen av parameterne er:
 Samme prinsipp må brukes på hver loggmappe som skal leses. Kommandoen gir
 ikke skrivetilgang til loggene.
 
+For å sette samme tilgang rekursivt og samtidig sikre at nye IIS-loggfiler
+arver rettighetene, kan [Set-IisLogReadAccess.ps1](Set-IisLogReadAccess.ps1)
+kjøres som administrator på serveren:
+
+```powershell
+.\Set-IisLogReadAccess.ps1 -LogPath 'C:\inetpub\logs\LogFiles' -AppPoolName 'LoggViewer'
+```
+
+Scriptet gir apppool-identiteten `RX`-tilgang, som betyr lese- og
+traverseringstilgang, men ikke skrivetilgang. `OI` og `CI` sørger for arv til
+filer og undermapper som opprettes senere. Test endringen først uten å gjøre
+den med `-WhatIf`.
+
+NTFS-rettigheter kan ikke styre om en prosess holder en fil åpen. LoggViewer
+bruker derfor `FileShare.ReadWrite | FileShare.Delete` ved lesing, slik at IIS
+kan skrive til og rotere loggfiler mens de leses.
+
 ## Lesing av aktive og skrive-låste logger
 
 Loggfiler kan være åpne og bli skrevet til av IIS eller applikasjonen mens
@@ -71,17 +94,81 @@ prosesser får fortsette å skrive til eller rotere filen. Mappetillatelsen og
 avgjør om IIS-applikasjonspoolen får tilgang til filen, mens `FileShare`
 avgjør om filen kan åpnes når den allerede er i bruk.
 
-## Kjøre lokalt
+## Bygging og kjøring
+
+`Debug` brukes bare ved lokal utvikling. `Release` brukes alltid når
+applikasjonen skal publiseres til Windows/IIS.
+
+Bygg for lokal kontroll:
 
 ```bash
-dotnet run --framework net8.0
+dotnet build -c Debug -f net8.0
 ```
 
-Løsningen kan også bygges for både .NET 8 og .NET 10:
+Kjør lokalt:
 
 ```bash
-dotnet build
+dotnet run -c Debug --framework net8.0
 ```
 
-Åpne adressen som vises i terminalen. Under lokal utvikling brukes testfilene
-som er definert i `appsettings.Development.json`.
+Prosjektet kan bygges mot både .NET 8 og .NET 10. Deploy bruker .NET 8 i
+eksemplene fordi det er prosjektets stabile servermål. En vanlig `dotnet
+build` uten `-c` er ikke en deploy-build.
+
+## Deploy på Windows/IIS
+
+Applikasjonen skal kjøres på Windows-serveren, ikke direkte i macOS-miljøet.
+Publiser fra utviklingsmaskinen med `Release`-konfigurasjon og Windows x64 som
+mål. Dette lager deployartefaktet i `artifacts/publish/win-x64`:
+
+```bash
+dotnet publish -c Release -f net8.0 -r win-x64 --self-contained false -o ./artifacts/publish/win-x64
+```
+
+Kopier innholdet i `artifacts/publish/win-x64` til serveren, sammen med
+`Set-IisLogReadAccess.ps1`. Ikke kopier `bin/Debug`, `bin/Release` eller
+`obj`; disse er lokale bygge- og mellomfiler og skal ikke deployes. Installer
+riktig .NET 8 Hosting Bundle på serveren dersom den ikke allerede er
+installert. Kjør deretter PowerShell som administrator på Windows-serveren:
+
+```powershell
+Set-Location 'C:\Apps\LoggViewer'
+& .\Set-IisLogReadAccess.ps1 `
+	-LogPath 'C:\inetpub\logs\LogFiles' `
+	-AppPoolName 'LoggViewer'
+```
+
+Før første kjøring kan tilgangene kontrolleres uten endringer:
+
+```powershell
+& .\Set-IisLogReadAccess.ps1 `
+	-LogPath 'C:\inetpub\logs\LogFiles' `
+	-AppPoolName 'LoggViewer' `
+	-WhatIf
+```
+
+Sett produksjonsverdier som miljøvariabler for IIS-applikasjonen, for eksempel:
+
+```powershell
+[Environment]::SetEnvironmentVariable('LocksApi__BaseUrl', 'https://integration.example.no', 'Machine')
+[Environment]::SetEnvironmentVariable('LocksApi__Username', 'amesto', 'Machine')
+[Environment]::SetEnvironmentVariable('LocksApi__Password', '<hemmelig-passord>', 'Machine')
+```
+
+Start apppoolet på nytt etter endringer i miljøvariabler. `LocksApi:BaseUrl`
+må være HTTPS, med unntak av `http://localhost`, som støttes for lokal API-
+installasjon. Unngå å legge produksjonspassord i `appsettings.json` eller
+committe det i repositoryet.
+
+### Sjekk før deploy
+
+Kontroller at publiseringen faktisk er `Release` og Windows x64:
+
+```bash
+dotnet publish -c Release -f net8.0 -r win-x64 --self-contained false -o ./artifacts/publish/win-x64
+```
+
+Det som skal kopieres til IIS-serveren er kun innholdet i
+`artifacts/publish/win-x64`. Under lokal utvikling brukes testfilene som er
+definert i `appsettings.Development.json`; på serveren brukes
+`appsettings.json` og IIS-miljøvariabler.

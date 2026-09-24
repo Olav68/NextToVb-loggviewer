@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
@@ -18,6 +19,11 @@ var inboundTestFile = GetTestFileConfiguration(builder.Configuration, "Inbound")
 var outboundTestFile = GetTestFileConfiguration(builder.Configuration, "Outbound");
 var inboundLogPath = ResolveLogDirectory(inboundConfiguredPath, inboundTestFile, demoLogFile);
 var outboundLogPath = ResolveLogDirectory(outboundConfiguredPath, outboundTestFile, demoLogFile);
+var locksApiBaseUrl = builder.Configuration["LocksApi:BaseUrl"] ?? "";
+var locksApiUsername = builder.Configuration["LocksApi:Username"] ?? "";
+var locksApiPassword = builder.Configuration["LocksApi:Password"] ?? "";
+
+builder.Services.AddHttpClient();
 
 var app = builder.Build();
 
@@ -212,7 +218,144 @@ app.MapGet("/api/outbound/summary", async (HttpContext context) =>
     return Results.Json(ComputeInboundMetrics(entries), GetJsonOptions());
 });
 
+app.MapGet("/api/locks", async (IHttpClientFactory httpClientFactory) =>
+{
+    if (!TryCreateLocksClient(httpClientFactory, locksApiBaseUrl, locksApiUsername, locksApiPassword, out var client, out var configurationError))
+        return Results.Json(new { error = configurationError }, statusCode: 503);
+
+    try
+    {
+        var endpointTasks = new[]
+        {
+            GetLocksAsync(client, "/api/Assignments/Locks"),
+            GetLocksAsync(client, "/api/Postings/Locks"),
+            GetLocksAsync(client, "/api/Remits/Locks"),
+            GetLocksAsync(client, "/api/OutboundInvoices/Locks")
+        };
+        var lockGroups = await Task.WhenAll(endpointTasks);
+        return Results.Json(lockGroups.SelectMany(group => group).OrderBy(lockItem => lockItem.TypeOfLock).ThenBy(lockItem => lockItem.InstallationId).ThenBy(lockItem => lockItem.LockId));
+    }
+    catch (LocksApiException exception)
+    {
+        return Results.Json(new { error = exception.Message }, statusCode: exception.StatusCode);
+    }
+});
+
+app.MapPost("/api/locks/unlock", async (UnlockLockRequest request, IHttpClientFactory httpClientFactory) =>
+{
+    var endpoint = request.TypeOfLock switch
+    {
+        "Posting" => $"/api/{Uri.EscapeDataString(request.InstallationId)}/Postings/Locks/{Uri.EscapeDataString(request.LockId)}/Unlock",
+        "Remit" => $"/api/{Uri.EscapeDataString(request.InstallationId)}/Remits/Locks/{Uri.EscapeDataString(request.LockId)}/Unlock",
+        "OutboundInvoice" => $"/api/{Uri.EscapeDataString(request.InstallationId)}/OutboundInvoices/Locks/{Uri.EscapeDataString(request.LockId)}/Unlock",
+        _ => null
+    };
+
+    if (endpoint == null)
+        return Results.BadRequest(new { error = "Denne låstypen kan ikke låses opp via API-et." });
+
+    if (string.IsNullOrWhiteSpace(request.InstallationId) || string.IsNullOrWhiteSpace(request.LockId))
+        return Results.BadRequest(new { error = "Installasjon og lås-ID må være utfylt." });
+
+    if (!TryCreateLocksClient(httpClientFactory, locksApiBaseUrl, locksApiUsername, locksApiPassword, out var client, out var configurationError))
+        return Results.Json(new { error = configurationError }, statusCode: 503);
+
+    using var response = await client.PostAsync(endpoint, new StringContent("{}", Encoding.UTF8, "application/json"));
+    if (!response.IsSuccessStatusCode)
+        return Results.Json(new { error = $"Unlock feilet med HTTP {(int)response.StatusCode}." }, statusCode: (int)response.StatusCode);
+
+    return Results.Ok(new { message = "Låsen er fjernet." });
+});
+
 app.Run();
+
+static bool TryCreateLocksClient(
+    IHttpClientFactory httpClientFactory,
+    string baseUrl,
+    string username,
+    string password,
+    out HttpClient client,
+    out string error)
+{
+    client = httpClientFactory.CreateClient();
+    error = "";
+
+    if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var baseUri) ||
+        (baseUri.Scheme != Uri.UriSchemeHttps &&
+         !(baseUri.Scheme == Uri.UriSchemeHttp &&
+           (baseUri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase) || baseUri.Host == "127.0.0.1"))))
+    {
+        error = "LocksApi:BaseUrl må være HTTPS, med unntak av localhost.";
+        return false;
+    }
+
+    if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+    {
+        error = "LocksApi:Username og LocksApi:Password må være konfigurert.";
+        return false;
+    }
+
+    client.BaseAddress = baseUri;
+    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
+        "Basic",
+        Convert.ToBase64String(Encoding.ASCII.GetBytes($"{username}:{password}")));
+    return true;
+}
+
+static async Task<List<SystemLockDto>> GetLocksAsync(HttpClient client, string endpoint)
+{
+    using var response = await client.GetAsync(endpoint);
+    if (response.StatusCode == HttpStatusCode.NotFound)
+        return new List<SystemLockDto>();
+
+    if (!response.IsSuccessStatusCode)
+        throw new LocksApiException($"Klarte ikke å hente låser fra {endpoint} (HTTP {(int)response.StatusCode}).", (int)response.StatusCode);
+
+    await using var stream = await response.Content.ReadAsStreamAsync();
+    using var document = await JsonDocument.ParseAsync(stream);
+    var locks = new List<SystemLockDto>();
+    ReadLocks(document.RootElement, locks);
+    return locks;
+}
+
+static void ReadLocks(JsonElement element, List<SystemLockDto> locks)
+{
+    if (element.ValueKind == JsonValueKind.Array)
+    {
+        foreach (var item in element.EnumerateArray())
+            ReadLockItem(item, locks);
+        return;
+    }
+
+    if (element.ValueKind == JsonValueKind.Object)
+    {
+        if (element.TryGetProperty("lockId", out _))
+        {
+            ReadLockItem(element, locks);
+            return;
+        }
+
+        foreach (var property in element.EnumerateObject())
+            ReadLocks(property.Value, locks);
+    }
+}
+
+static void ReadLockItem(JsonElement element, List<SystemLockDto> locks)
+{
+    if (element.ValueKind != JsonValueKind.Object)
+        return;
+
+    var installationId = GetJsonString(element, "installationId");
+    var lockId = GetJsonString(element, "lockId");
+    var typeOfLock = GetJsonString(element, "typeOfLock");
+    if (!string.IsNullOrWhiteSpace(lockId))
+        locks.Add(new SystemLockDto(installationId, lockId, typeOfLock, GetJsonString(element, "errorMessage")));
+}
+
+static string GetJsonString(JsonElement element, string name)
+{
+    return element.TryGetProperty(name, out var value) ? value.ToString() : "";
+}
 
 static string GetTestFileConfiguration(IConfiguration configuration, string source)
 {
@@ -938,6 +1081,43 @@ h1 {
 .inbound-muted {
     color: #666;
 }
+.locks-panel {
+    padding: 14px;
+}
+.locks-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 14px;
+}
+.locks-status {
+    color: #666;
+}
+.lock-action {
+    border: 1px solid #888;
+    background: #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 1.1rem;
+    line-height: 1;
+    padding: 6px 9px;
+}
+.lock-action:hover:not(:disabled) {
+    background: #e8f2ff;
+}
+.lock-action:disabled {
+    cursor: not-allowed;
+    opacity: .45;
+}
+.lock-error {
+    max-width: 420px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.locks-empty {
+    color: #666;
+    padding: 12px 0;
+}
 pre {
     margin: 0;
     background: #fafafa;
@@ -1163,6 +1343,76 @@ function renderFilteredOutbound() {
     document.getElementById('outbound-summary').innerHTML = renderInboundSummary(entries);
 }
 
+var locksData = [];
+
+async function loadLocks() {
+    var summary = document.getElementById('locks-summary');
+    summary.innerText = 'Laster låser...';
+    try {
+        var response = await fetch('/api/locks');
+        var result = await response.json();
+        if (!response.ok) {
+            summary.innerText = result.error || 'Klarte ikke å hente låser.';
+            return;
+        }
+        locksData = result;
+        renderLocks();
+    } catch (error) {
+        summary.innerText = 'Feil ved lasting av låser.';
+    }
+}
+
+function renderLocks() {
+    var summary = document.getElementById('locks-summary');
+    if (!locksData.length) {
+        summary.innerHTML = '<div class="locks-empty">Fant ingen aktive låser.</div>';
+        return;
+    }
+
+    var html = '<table class="iis-table"><thead><tr><th>Type</th><th>Installasjon</th><th>Lås-ID</th><th>Feilmelding</th><th>Handling</th></tr></thead><tbody>';
+    for (var lock of locksData) {
+        var canUnlock = lock.typeOfLock !== 'Assignment';
+        var title = canUnlock ? 'Lås opp' : 'Assignment-låser har ikke unlock-endepunkt';
+        html += '<tr><td>' + escapeHtml(lock.typeOfLock) + '</td>';
+        html += '<td>' + escapeHtml(lock.installationId) + '</td>';
+        html += '<td>' + escapeHtml(lock.lockId) + '</td>';
+        html += '<td class="lock-error">' + escapeHtml(lock.errorMessage || '') + '</td><td>';
+        html += '<button class="lock-action" title="' + escapeHtml(title) + '" aria-label="' + escapeHtml(title) + '"';
+        html += ' data-installation-id="' + escapeHtml(lock.installationId) + '" data-lock-id="' + escapeHtml(lock.lockId) + '" data-type-of-lock="' + escapeHtml(lock.typeOfLock) + '"';
+        if (!canUnlock) html += ' disabled';
+        html += ' onclick="unlockLock(this)">&#128274;</button></td></tr>';
+    }
+    summary.innerHTML = html + '</tbody></table>';
+}
+
+async function unlockLock(button) {
+    var lock = {
+        installationId: button.dataset.installationId,
+        lockId: button.dataset.lockId,
+        typeOfLock: button.dataset.typeOfLock
+    };
+    if (!confirm('Låse opp ' + lock.typeOfLock + ' ' + lock.lockId + '?')) return;
+
+    button.disabled = true;
+    try {
+        var response = await fetch('/api/locks/unlock', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(lock)
+        });
+        var result = await response.json();
+        if (!response.ok) {
+            alert(result.error || 'Klarte ikke å låse opp posten.');
+            button.disabled = false;
+            return;
+        }
+        await loadLocks();
+    } catch (error) {
+        alert('Feil ved unlock-kallet.');
+        button.disabled = false;
+    }
+}
+
 function populateLogLevels(selectId, entries) {
     var select = document.getElementById(selectId);
     var selected = select.value;
@@ -1278,7 +1528,7 @@ function escapeHtml(value) {
 }
 </script>
 </head>
-<body onload="showTab('__INITIAL_TAB__'); if ('__INITIAL_TAB__' === 'iis') loadIisFiles(); if ('__INITIAL_TAB__' === 'inbound') loadInboundFiles(); if ('__INITIAL_TAB__' === 'outbound') loadOutboundFiles()">
+<body onload="showTab('__INITIAL_TAB__'); if ('__INITIAL_TAB__' === 'iis') loadIisFiles(); if ('__INITIAL_TAB__' === 'inbound') loadInboundFiles(); if ('__INITIAL_TAB__' === 'outbound') loadOutboundFiles(); if ('__INITIAL_TAB__' === 'locks') loadLocks()">
 <h1>Loggvisning</h1>
 <div class="path"><b>Fil:</b> __FILE__</div>
 
@@ -1289,6 +1539,7 @@ function escapeHtml(value) {
     <button id="btn-iis" class="tab-button" onclick="showTab('iis'); loadIisFiles()">IIS</button>
     <button id="btn-inbound" class="tab-button" onclick="showTab('inbound'); loadInboundFiles('__INBOUND_DATE__')">Inbound</button>
     <button id="btn-outbound" class="tab-button" onclick="showTab('outbound'); loadOutboundFiles('__INBOUND_DATE__')">OutBound</button>
+    <button id="btn-locks" class="tab-button" onclick="showTab('locks'); loadLocks()">Låser</button>
 </div>
 
 <div id="tab-data" class="tab-content active">
@@ -1355,6 +1606,16 @@ function escapeHtml(value) {
             <button onclick="document.getElementById('outbound-level').value=''; document.getElementById('outbound-time-from').value=''; document.getElementById('outbound-time-to').value=''; renderFilteredOutbound()">Nullstill</button>
         </div>
         <div id="outbound-summary" class="iis-summary">Velg en dato for å lese OutBound-loggen.</div>
+    </div>
+</div>
+
+<div id="tab-locks" class="tab-content">
+    <div class="locks-panel">
+        <div class="locks-toolbar">
+            <button onclick="loadLocks()">Oppdater</button>
+            <span class="locks-status">Låser fra alle aktive installasjoner</span>
+        </div>
+        <div id="locks-summary" class="iis-summary">Trykk «Oppdater» for å hente låser.</div>
     </div>
 </div>
 
