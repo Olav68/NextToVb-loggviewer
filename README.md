@@ -111,24 +111,27 @@ Kjør lokalt:
 dotnet run -c Debug --framework net8.0
 ```
 
-Prosjektet kan bygges mot både .NET 8 og .NET 10. Deploy bruker .NET 8 i
-eksemplene fordi det er prosjektets stabile servermål. En vanlig `dotnet
-build` uten `-c` er ikke en deploy-build.
+Prosjektet bygges mot både .NET 8 og .NET 10, og begge publiseres ved hver
+deploy fordi serverne kjører begge versjonene. En vanlig `dotnet build` uten
+`-c` er ikke en deploy-build.
 
 ## Deploy på Windows/IIS
 
 Applikasjonen skal kjøres på Windows-serveren, ikke direkte i macOS-miljøet.
 Publiser fra utviklingsmaskinen med `Release`-konfigurasjon og Windows x64 som
-mål. Dette lager deployartefaktet i `artifacts/publish/win-x64`:
+mål. Dette lager ett deployartefakt per .NET-versjon under `artifacts/publish`:
 
 ```bash
-dotnet publish -c Release -f net8.0 -r win-x64 --self-contained false -o ./artifacts/publish/win-x64
+dotnet publish -c Release -f net8.0 -r win-x64 --self-contained false -o ./artifacts/publish/net8.0/win-x64
+dotnet publish -c Release -f net10.0 -r win-x64 --self-contained false -o ./artifacts/publish/net10.0/win-x64
 ```
 
-Kopier innholdet i `artifacts/publish/win-x64` til serveren, sammen med
+Kopier innholdet i mappen som passer serverens .NET-versjon
+(`artifacts/publish/net8.0/win-x64` eller `artifacts/publish/net10.0/win-x64`)
+til serveren, sammen med
 `Set-IisLogReadAccess.ps1`. Ikke kopier `bin/Debug`, `bin/Release` eller
 `obj`; disse er lokale bygge- og mellomfiler og skal ikke deployes. Installer
-riktig .NET 8 Hosting Bundle på serveren dersom den ikke allerede er
+riktig .NET 8 eller .NET 10 Hosting Bundle på serveren dersom den ikke allerede er
 installert. Kjør deretter PowerShell som administrator på Windows-serveren:
 
 ```powershell
@@ -165,10 +168,12 @@ committe det i repositoryet.
 Kontroller at publiseringen faktisk er `Release` og Windows x64:
 
 ```bash
-dotnet publish -c Release -f net8.0 -r win-x64 --self-contained false -o ./artifacts/publish/win-x64
+dotnet publish -c Release -f net8.0 -r win-x64 --self-contained false -o ./artifacts/publish/net8.0/win-x64
+dotnet publish -c Release -f net10.0 -r win-x64 --self-contained false -o ./artifacts/publish/net10.0/win-x64
 ```
 
 Det som skal kopieres til IIS-serveren er kun innholdet i
-`artifacts/publish/win-x64`. Under lokal utvikling brukes testfilene som er
+`artifacts/publish/net8.0/win-x64` eller `artifacts/publish/net10.0/win-x64`,
+avhengig av serverens .NET-versjon. Under lokal utvikling brukes testfilene som er
 definert i `appsettings.Development.json`; på serveren brukes
 `appsettings.json` og IIS-miljøvariabler.
