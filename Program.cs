@@ -24,6 +24,9 @@ var locksApiUsername = builder.Configuration["LocksApi:Username"] ?? "";
 var locksApiPassword = builder.Configuration["LocksApi:Password"] ?? "";
 
 builder.Services.AddHttpClient();
+// Omdirigeringer (f.eks. RequireHttps) skal vises som feil, ikke følges stille til en annen adresse.
+builder.Services.AddHttpClient("LocksApi")
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
 
 var app = builder.Build();
 
@@ -276,7 +279,7 @@ app.MapPost("/api/locks/unlock", async (UnlockLockRequest request, IHttpClientFa
     {
         app.Logger.LogInformation("Locks API: POST {Uri} -> HTTP {StatusCode}", requestUri, (int)response.StatusCode);
         if (!response.IsSuccessStatusCode)
-            return Results.Json(new { error = $"Unlock feilet mot {requestUri} (HTTP {(int)response.StatusCode})." }, statusCode: (int)response.StatusCode);
+            return Results.Json(new { error = $"Unlock feilet mot {requestUri} (HTTP {(int)response.StatusCode}){DescribeRedirect(response)}." }, statusCode: IsRedirect(response) ? 502 : (int)response.StatusCode);
     }
 
     return Results.Ok(new { message = "Låsen er fjernet." });
@@ -292,7 +295,7 @@ static bool TryCreateLocksClient(
     out HttpClient client,
     out string error)
 {
-    client = httpClientFactory.CreateClient();
+    client = httpClientFactory.CreateClient("LocksApi");
     error = "";
 
     if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var baseUri) ||
@@ -339,7 +342,7 @@ static async Task<List<SystemLockDto>> GetLocksAsync(HttpClient client, string e
         logger.LogInformation("Locks API: GET {Uri} -> HTTP {StatusCode}: {Body}", requestUri, (int)response.StatusCode, snippet);
 
         if (!response.IsSuccessStatusCode)
-            throw new LocksApiException($"Klarte ikke å hente låser fra {requestUri} (HTTP {(int)response.StatusCode}).", (int)response.StatusCode);
+            throw new LocksApiException($"Klarte ikke å hente låser fra {requestUri} (HTTP {(int)response.StatusCode}){DescribeRedirect(response)}.", IsRedirect(response) ? 502 : (int)response.StatusCode);
 
         JsonDocument document;
         try
@@ -358,6 +361,18 @@ static async Task<List<SystemLockDto>> GetLocksAsync(HttpClient client, string e
             return locks;
         }
     }
+}
+
+static bool IsRedirect(HttpResponseMessage response)
+{
+    return (int)response.StatusCode is >= 300 and < 400;
+}
+
+static string DescribeRedirect(HttpResponseMessage response)
+{
+    return IsRedirect(response) && response.Headers.Location != null
+        ? $" – API-et omdirigerer til {response.Headers.Location}. Sett LocksApi:BaseUrl til HTTPS-adressen til API-et"
+        : "";
 }
 
 static void ReadLocks(JsonElement element, List<SystemLockDto> locks)
