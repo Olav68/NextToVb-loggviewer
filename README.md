@@ -33,6 +33,12 @@ Følgende innstillinger brukes:
 	testfiler som overstyrer standardstiene.
 - `LocksApi:BaseUrl`: HTTPS-adressen til DNBIntegrationServices.
 - `LocksApi:Username` og `LocksApi:Password`: Basic Auth for lock-endepunktene.
+- `LocksDb:ConnectionString`: Valgfri tilkobling til konfigurasjonsdatabasen
+	(`NextToVB`) der tabellen `LockStore` ligger. Når den er satt, leses låsene
+	direkte fra tabellen. Da vises også Assignment-låser, som
+	`api/Assignments/Locks` ikke klarer å returnere (HTTP 500), og tidspunktet
+	låsen ble opprettet. Unlock går fortsatt via API-et. Eksempel:
+	`Data Source=.;Initial Catalog=NextToVB;Integrated Security=True;TrustServerCertificate=True`
 
 Låser av typen Assignment vises i Låser-fanen, men kan ikke låses opp fordi
 API-et ikke har et aktivt unlock-endepunkt for denne typen. Password bør settes

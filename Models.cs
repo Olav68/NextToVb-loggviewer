@@ -6,7 +6,7 @@ public record IisEntry(DateTime Timestamp, string Method, string UriStem, string
 
 public record InboundEntry(DateTime Timestamp, string Level, string Message);
 
-public sealed record SystemLockDto(string InstallationId, string LockId, string TypeOfLock, string ErrorMessage);
+public sealed record SystemLockDto(string InstallationId, string LockId, string TypeOfLock, string ErrorMessage, DateTime? CreatedDateTime);
 
 public sealed record UnlockLockRequest(string InstallationId, string LockId, string TypeOfLock);
 

@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using Microsoft.Data.SqlClient;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -22,6 +23,7 @@ var outboundLogPath = ResolveLogDirectory(outboundConfiguredPath, outboundTestFi
 var locksApiBaseUrl = builder.Configuration["LocksApi:BaseUrl"] ?? "";
 var locksApiUsername = builder.Configuration["LocksApi:Username"] ?? "";
 var locksApiPassword = builder.Configuration["LocksApi:Password"] ?? "";
+var locksDbConnectionString = builder.Configuration["LocksDb:ConnectionString"] ?? "";
 
 builder.Services.AddHttpClient();
 // Omdirigeringer (f.eks. RequireHttps) skal vises som feil, ikke følges stille til en annen adresse.
@@ -223,16 +225,37 @@ app.MapGet("/api/outbound/summary", async (HttpContext context) =>
 
 app.MapGet("/api/locks", async (IHttpClientFactory httpClientFactory) =>
 {
+    // Direkte lesing fra LockStore gir også Assignment-låser (API-endepunktet svarer 500) og tidspunkt for låsen.
+    if (!string.IsNullOrWhiteSpace(locksDbConnectionString))
+    {
+        try
+        {
+            return Results.Json(new { locks = await GetLocksFromDatabaseAsync(locksDbConnectionString), errors = Array.Empty<string>() });
+        }
+        catch (Exception exception) when (exception is SqlException or InvalidOperationException or ArgumentException)
+        {
+            app.Logger.LogWarning(exception, "LockStore: lesing feilet");
+            return Results.Json(new { error = $"Klarte ikke å lese låser fra databasen: {exception.Message}" }, statusCode: 502);
+        }
+    }
+
     if (!TryCreateLocksClient(httpClientFactory, locksApiBaseUrl, locksApiUsername, locksApiPassword, out var client, out var configurationError))
         return Results.Json(new { error = configurationError }, statusCode: 503);
 
     // Hvert endepunkt hentes for seg, slik at én feil ikke skjuler låser fra de andre.
-    var endpoints = new[] { "api/Assignments/Locks", "api/Postings/Locks", "api/Remits/Locks", "api/OutboundInvoices/Locks" };
+    // API-et returnerer ikke riktig låstype (kolonnen LockType mappes ikke til TypeOfLock), så typen settes ut fra endepunktet.
+    var endpoints = new[]
+    {
+        (Path: "api/Assignments/Locks", LockType: "Assignment"),
+        (Path: "api/Postings/Locks", LockType: "Posting"),
+        (Path: "api/Remits/Locks", LockType: "Remit"),
+        (Path: "api/OutboundInvoices/Locks", LockType: "OutboundInvoice")
+    };
     var results = await Task.WhenAll(endpoints.Select(async endpoint =>
     {
         try
         {
-            return (Locks: await GetLocksAsync(client, endpoint, app.Logger), Error: (string?)null);
+            return (Locks: await GetLocksAsync(client, endpoint.Path, endpoint.LockType, app.Logger), Error: (string?)null);
         }
         catch (LocksApiException exception)
         {
@@ -322,7 +345,30 @@ static bool TryCreateLocksClient(
     return true;
 }
 
-static async Task<List<SystemLockDto>> GetLocksAsync(HttpClient client, string endpoint, ILogger logger)
+static async Task<List<SystemLockDto>> GetLocksFromDatabaseAsync(string connectionString)
+{
+    const string sql = "SELECT InstallationId, LockType, LockId, ErrorMessage, CreatedDateTime FROM LockStore ORDER BY CreatedDateTime DESC";
+
+    await using var connection = new SqlConnection(connectionString);
+    await connection.OpenAsync();
+    await using var command = new SqlCommand(sql, connection);
+    await using var reader = await command.ExecuteReaderAsync();
+
+    var locks = new List<SystemLockDto>();
+    while (await reader.ReadAsync())
+    {
+        locks.Add(new SystemLockDto(
+            reader.IsDBNull(0) ? "" : reader.GetValue(0).ToString()!,
+            reader.IsDBNull(2) ? "" : reader.GetValue(2).ToString()!,
+            reader.IsDBNull(1) ? "" : reader.GetValue(1).ToString()!,
+            reader.IsDBNull(3) ? "" : reader.GetValue(3).ToString()!,
+            reader.IsDBNull(4) ? null : Convert.ToDateTime(reader.GetValue(4))));
+    }
+
+    return locks;
+}
+
+static async Task<List<SystemLockDto>> GetLocksAsync(HttpClient client, string endpoint, string lockType, ILogger logger)
 {
     var requestUri = new Uri(client.BaseAddress!, endpoint);
     HttpResponseMessage response;
@@ -359,7 +405,7 @@ static async Task<List<SystemLockDto>> GetLocksAsync(HttpClient client, string e
         {
             var locks = new List<SystemLockDto>();
             ReadLocks(document.RootElement, locks);
-            return locks;
+            return locks.Select(lockItem => lockItem with { TypeOfLock = lockType }).ToList();
         }
     }
 }
@@ -434,7 +480,7 @@ static void ReadLockItem(JsonElement element, List<SystemLockDto> locks)
     var lockId = GetJsonString(element, "lockId");
     var typeOfLock = GetJsonString(element, "typeOfLock");
     if (!string.IsNullOrWhiteSpace(lockId))
-        locks.Add(new SystemLockDto(installationId, lockId, typeOfLock, GetJsonString(element, "errorMessage")));
+        locks.Add(new SystemLockDto(installationId, lockId, typeOfLock, GetJsonString(element, "errorMessage"), null));
 }
 
 static string GetJsonString(JsonElement element, string name)
@@ -1477,13 +1523,14 @@ function renderLocks() {
         return;
     }
 
-    var html = errorHtml + '<table class="iis-table"><thead><tr><th>Type</th><th>Installasjon</th><th>Lås-ID</th><th>Feilmelding</th><th>Handling</th></tr></thead><tbody>';
+    var html = errorHtml + '<table class="iis-table"><thead><tr><th>Type</th><th>Installasjon</th><th>Lås-ID</th><th>Opprettet</th><th>Feilmelding</th><th>Handling</th></tr></thead><tbody>';
     for (var lock of locksData) {
         var canUnlock = lock.typeOfLock !== 'Assignment';
         var title = canUnlock ? 'Lås opp' : 'Assignment-låser har ikke unlock-endepunkt';
         html += '<tr><td>' + escapeHtml(lock.typeOfLock) + '</td>';
         html += '<td>' + escapeHtml(lock.installationId) + '</td>';
         html += '<td>' + escapeHtml(lock.lockId) + '</td>';
+        html += '<td>' + escapeHtml(lock.createdDateTime ? new Date(lock.createdDateTime).toLocaleString('nb-NO') : '') + '</td>';
         html += '<td class="lock-error">' + escapeHtml(lock.errorMessage || '') + '</td><td>';
         html += '<button class="lock-action" title="' + escapeHtml(title) + '" aria-label="' + escapeHtml(title) + '"';
         html += ' data-installation-id="' + escapeHtml(lock.installationId) + '" data-lock-id="' + escapeHtml(lock.lockId) + '" data-type-of-lock="' + escapeHtml(lock.typeOfLock) + '"';
