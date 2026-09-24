@@ -121,22 +121,29 @@ Prosjektet bygges mot både .NET 8 og .NET 10, og begge publiseres ved hver
 deploy fordi serverne kjører begge versjonene. En vanlig `dotnet build` uten
 `-c` er ikke en deploy-build.
 
+Byggefiler (`bin` og `obj`) havner i den skjulte mappen `.build`, satt opp i
+`Directory.Build.props`. Den trenger du aldri å åpne; den kan slettes når som
+helst og bygges opp igjen automatisk.
+
 ## Deploy på Windows/IIS
 
 Applikasjonen skal kjøres på Windows-serveren, ikke direkte i macOS-miljøet.
-Publiser fra utviklingsmaskinen med `Release`-konfigurasjon og Windows x64 som
-mål. Dette lager ett deployartefakt per .NET-versjon under `artifacts/publish`:
+Publiser fra utviklingsmaskinen med skriptet `publish.sh`. Det bygger
+`Release` for Windows x64 og lager én ferdig mappe per .NET-versjon:
 
 ```bash
-dotnet publish -c Release -f net8.0 -r win-x64 --self-contained false -o ./artifacts/publish/net8.0/win-x64
-dotnet publish -c Release -f net10.0 -r win-x64 --self-contained false -o ./artifacts/publish/net10.0/win-x64
+./publish.sh
 ```
 
-Kopier innholdet i mappen som passer serverens .NET-versjon
-(`artifacts/publish/net8.0/win-x64` eller `artifacts/publish/net10.0/win-x64`)
-til serveren, sammen med
-`Set-IisLogReadAccess.ps1`. Ikke kopier `bin/Debug`, `bin/Release` eller
-`obj`; disse er lokale bygge- og mellomfiler og skal ikke deployes. Installer
+| Server kjører | Kopier innholdet i |
+|---|---|
+| .NET 8 | `deploy/net8.0` |
+| .NET 10 | `deploy/net10.0` |
+
+Mappene tømmes og bygges på nytt hver gang skriptet kjøres. Kopier innholdet
+til serveren, sammen med `Set-IisLogReadAccess.ps1` ved første installasjon.
+Behold serverens egen `appsettings.json` dersom den har andre verdier enn
+repositoryet. `appsettings.Development.json` publiseres ikke. Installer
 riktig .NET 8 eller .NET 10 Hosting Bundle på serveren dersom den ikke allerede er
 installert. Kjør deretter PowerShell som administrator på Windows-serveren:
 
@@ -171,15 +178,8 @@ committe det i repositoryet.
 
 ### Sjekk før deploy
 
-Kontroller at publiseringen faktisk er `Release` og Windows x64:
-
-```bash
-dotnet publish -c Release -f net8.0 -r win-x64 --self-contained false -o ./artifacts/publish/net8.0/win-x64
-dotnet publish -c Release -f net10.0 -r win-x64 --self-contained false -o ./artifacts/publish/net10.0/win-x64
-```
-
-Det som skal kopieres til IIS-serveren er kun innholdet i
-`artifacts/publish/net8.0/win-x64` eller `artifacts/publish/net10.0/win-x64`,
-avhengig av serverens .NET-versjon. Under lokal utvikling brukes testfilene som er
+Kjør `./publish.sh` på nytt rett før deploy, slik at `deploy/` er bygget fra
+siste kode. Det som skal kopieres til IIS-serveren er kun innholdet i
+`deploy/net8.0` eller `deploy/net10.0`, avhengig av serverens .NET-versjon. Under lokal utvikling brukes testfilene som er
 definert i `appsettings.Development.json`; på serveren brukes
 `appsettings.json` og IIS-miljøvariabler.

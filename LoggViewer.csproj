@@ -7,7 +7,7 @@
     <!-- Publiser bare engelske ressurser, ikke språkmapper (cs, de, fr, ...) fra NuGet-pakkene. -->
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <!-- Publiseringsmappen og lokale testfiler ligger i prosjektmappen og skal ikke med i neste publisering. -->
-    <DefaultItemExcludes>$(DefaultItemExcludes);artifacts/**;testfiler/**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);deploy/**;testfiler/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">

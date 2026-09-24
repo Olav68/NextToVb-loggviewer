@@ -1,6 +1,7 @@
+.build/
+deploy/
 bin/
 obj/
-artifacts/
 .DS_Store
 .vscode/
 testfiler/
