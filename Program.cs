@@ -227,10 +227,10 @@ app.MapGet("/api/locks", async (IHttpClientFactory httpClientFactory) =>
     {
         var endpointTasks = new[]
         {
-            GetLocksAsync(client, "/api/Assignments/Locks"),
-            GetLocksAsync(client, "/api/Postings/Locks"),
-            GetLocksAsync(client, "/api/Remits/Locks"),
-            GetLocksAsync(client, "/api/OutboundInvoices/Locks")
+            GetLocksAsync(client, "api/Assignments/Locks", app.Logger),
+            GetLocksAsync(client, "api/Postings/Locks", app.Logger),
+            GetLocksAsync(client, "api/Remits/Locks", app.Logger),
+            GetLocksAsync(client, "api/OutboundInvoices/Locks", app.Logger)
         };
         var lockGroups = await Task.WhenAll(endpointTasks);
         return Results.Json(lockGroups.SelectMany(group => group).OrderBy(lockItem => lockItem.TypeOfLock).ThenBy(lockItem => lockItem.InstallationId).ThenBy(lockItem => lockItem.LockId));
@@ -245,9 +245,9 @@ app.MapPost("/api/locks/unlock", async (UnlockLockRequest request, IHttpClientFa
 {
     var endpoint = request.TypeOfLock switch
     {
-        "Posting" => $"/api/{Uri.EscapeDataString(request.InstallationId)}/Postings/Locks/{Uri.EscapeDataString(request.LockId)}/Unlock",
-        "Remit" => $"/api/{Uri.EscapeDataString(request.InstallationId)}/Remits/Locks/{Uri.EscapeDataString(request.LockId)}/Unlock",
-        "OutboundInvoice" => $"/api/{Uri.EscapeDataString(request.InstallationId)}/OutboundInvoices/Locks/{Uri.EscapeDataString(request.LockId)}/Unlock",
+        "Posting" => $"api/{Uri.EscapeDataString(request.InstallationId)}/Postings/Locks/{Uri.EscapeDataString(request.LockId)}/Unlock",
+        "Remit" => $"api/{Uri.EscapeDataString(request.InstallationId)}/Remits/Locks/{Uri.EscapeDataString(request.LockId)}/Unlock",
+        "OutboundInvoice" => $"api/{Uri.EscapeDataString(request.InstallationId)}/OutboundInvoices/Locks/{Uri.EscapeDataString(request.LockId)}/Unlock",
         _ => null
     };
 
@@ -260,9 +260,24 @@ app.MapPost("/api/locks/unlock", async (UnlockLockRequest request, IHttpClientFa
     if (!TryCreateLocksClient(httpClientFactory, locksApiBaseUrl, locksApiUsername, locksApiPassword, out var client, out var configurationError))
         return Results.Json(new { error = configurationError }, statusCode: 503);
 
-    using var response = await client.PostAsync(endpoint, new StringContent("{}", Encoding.UTF8, "application/json"));
-    if (!response.IsSuccessStatusCode)
-        return Results.Json(new { error = $"Unlock feilet med HTTP {(int)response.StatusCode}." }, statusCode: (int)response.StatusCode);
+    var requestUri = new Uri(client.BaseAddress!, endpoint);
+    HttpResponseMessage response;
+    try
+    {
+        response = await client.PostAsync(requestUri, new StringContent("{}", Encoding.UTF8, "application/json"));
+    }
+    catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
+    {
+        app.Logger.LogWarning(exception, "Locks API: POST {Uri} feilet", requestUri);
+        return Results.Json(new { error = $"Fikk ikke kontakt med {requestUri}: {exception.Message}" }, statusCode: 502);
+    }
+
+    using (response)
+    {
+        app.Logger.LogInformation("Locks API: POST {Uri} -> HTTP {StatusCode}", requestUri, (int)response.StatusCode);
+        if (!response.IsSuccessStatusCode)
+            return Results.Json(new { error = $"Unlock feilet mot {requestUri} (HTTP {(int)response.StatusCode})." }, statusCode: (int)response.StatusCode);
+    }
 
     return Results.Ok(new { message = "Låsen er fjernet." });
 });
@@ -295,27 +310,54 @@ static bool TryCreateLocksClient(
         return false;
     }
 
-    client.BaseAddress = baseUri;
+    // Avsluttende skråstrek sikrer at en ev. virtuell katalog i BaseUrl beholdes når relative endepunkter legges til.
+    client.BaseAddress = baseUri.AbsoluteUri.EndsWith('/') ? baseUri : new Uri(baseUri.AbsoluteUri + "/");
     client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
         "Basic",
         Convert.ToBase64String(Encoding.ASCII.GetBytes($"{username}:{password}")));
     return true;
 }
 
-static async Task<List<SystemLockDto>> GetLocksAsync(HttpClient client, string endpoint)
+static async Task<List<SystemLockDto>> GetLocksAsync(HttpClient client, string endpoint, ILogger logger)
 {
-    using var response = await client.GetAsync(endpoint);
-    if (response.StatusCode == HttpStatusCode.NotFound)
-        return new List<SystemLockDto>();
+    var requestUri = new Uri(client.BaseAddress!, endpoint);
+    HttpResponseMessage response;
+    try
+    {
+        response = await client.GetAsync(requestUri);
+    }
+    catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
+    {
+        logger.LogWarning(exception, "Locks API: GET {Uri} feilet", requestUri);
+        throw new LocksApiException($"Fikk ikke kontakt med {requestUri}: {exception.Message}", 502);
+    }
 
-    if (!response.IsSuccessStatusCode)
-        throw new LocksApiException($"Klarte ikke å hente låser fra {endpoint} (HTTP {(int)response.StatusCode}).", (int)response.StatusCode);
+    using (response)
+    {
+        var body = await response.Content.ReadAsStringAsync();
+        var snippet = body.Length > 300 ? body[..300] + "..." : body;
+        logger.LogInformation("Locks API: GET {Uri} -> HTTP {StatusCode}: {Body}", requestUri, (int)response.StatusCode, snippet);
 
-    await using var stream = await response.Content.ReadAsStreamAsync();
-    using var document = await JsonDocument.ParseAsync(stream);
-    var locks = new List<SystemLockDto>();
-    ReadLocks(document.RootElement, locks);
-    return locks;
+        if (!response.IsSuccessStatusCode)
+            throw new LocksApiException($"Klarte ikke å hente låser fra {requestUri} (HTTP {(int)response.StatusCode}).", (int)response.StatusCode);
+
+        JsonDocument document;
+        try
+        {
+            document = JsonDocument.Parse(body);
+        }
+        catch (JsonException)
+        {
+            throw new LocksApiException($"Svaret fra {requestUri} er ikke gyldig JSON (HTTP {(int)response.StatusCode}): {snippet}", 502);
+        }
+
+        using (document)
+        {
+            var locks = new List<SystemLockDto>();
+            ReadLocks(document.RootElement, locks);
+            return locks;
+        }
+    }
 }
 
 static void ReadLocks(JsonElement element, List<SystemLockDto> locks)
@@ -329,7 +371,7 @@ static void ReadLocks(JsonElement element, List<SystemLockDto> locks)
 
     if (element.ValueKind == JsonValueKind.Object)
     {
-        if (element.TryGetProperty("lockId", out _))
+        if (TryGetPropertyIgnoreCase(element, "lockId", out _))
         {
             ReadLockItem(element, locks);
             return;
@@ -354,7 +396,22 @@ static void ReadLockItem(JsonElement element, List<SystemLockDto> locks)
 
 static string GetJsonString(JsonElement element, string name)
 {
-    return element.TryGetProperty(name, out var value) ? value.ToString() : "";
+    return TryGetPropertyIgnoreCase(element, name, out var value) ? value.ToString() : "";
+}
+
+static bool TryGetPropertyIgnoreCase(JsonElement element, string name, out JsonElement value)
+{
+    foreach (var property in element.EnumerateObject())
+    {
+        if (property.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+        {
+            value = property.Value;
+            return true;
+        }
+    }
+
+    value = default;
+    return false;
 }
 
 static string GetTestFileConfiguration(IConfiguration configuration, string source)
